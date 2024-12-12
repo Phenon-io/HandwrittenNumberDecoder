@@ -39,6 +39,10 @@ class CNN(nn.Module):
     def __init__(self):
         super(CNN, self).__init__()
         self.loss =[]
+        self.test_loss = []
+        self.test_accuracy = []
+        self.train_accuracy = []
+        self.validation_accuracy = []
         self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
         self.relu = nn.ReLU()
         self.pool = nn.MaxPool2d(2, 2)
@@ -60,12 +64,22 @@ class CNN(nn.Module):
 class LinearLayer(nn.Module):
     def __init__(self, input_size, num_classes): # Input size must match CNN output
         super(LinearLayer, self).__init__()
-        self.loss =[]
-        self.fc2 = nn.Linear(input_size, 50)
-        self.fc3 = nn.Linear(50, num_classes)
+        self.loss = []
+        self.test_loss = []
+        self.test_accuracy = []
+        self.train_accuracy = []
+        self.validation_accuracy = []
+        self.fc1 = nn.Linear(input_size, 256)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Linear(256, 128)
+        self.relu2 = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
+        self.fc3 = nn.Linear(128, num_classes)
 
     def forward(self, x):
-        x = self.fc2(x)
+        x = self.relu1(self.fc1(x))
+        x = self.relu2(self.fc2(x))
+        x = self.dropout(x)
         x = self.fc3(x)
         return x
     def set_loss(self, loss):     
@@ -80,7 +94,7 @@ class XGBoostClassifier:
         self.linear_layer = linear_layer
         self.xgb_params = xgb_params if xgb_params else {'max_depth': 3, 'eta': 0.3, 'objective': 'multi:softmax', 'num_class': 10}
         self.num_boost_round = num_boost_round
-        self.bst = None  # Initialize the XGBoost model
+        self.bst = None
 
     def train(self, train_data, train_labels):
         dtrain = xgb.DMatrix(data=train_data, label=train_labels) # train_data already contains the required features
@@ -98,20 +112,22 @@ def train_models(cnn, linear_layer, xgb_classifier, cnn_epochs, linear_epochs, c
     cnn.train()
     linear_layer.train()
 
-    cnn_losses = []
-    linear_losses = []
-
     for epoch in range(cnn_epochs):
         running_loss = 0.0
+        correct = 0
         for data, labels in train_loader: # Use train_loader
             data, labels = data.to(device), labels.to(device) # Send directly to device
             cnn_optimizer.zero_grad()
             output = cnn(data)
             loss = loss_fn(output, labels)
-            running_loss += loss.item()
+            _, preds = torch.max(output, 1)  # Get predicted classes
+            correct += torch.sum(preds == labels.data).item() # Accumulate correct predicitions
+            running_loss += loss.item() * data.size(0)
             cnn.loss.append(loss.item())
+            cnn.train_accuracy.append(correct / len(train_loader.dataset))
             loss.backward()
             cnn_optimizer.step()
+            
         epoch_loss = running_loss / len(train_loader.dataset)
         #cnn.loss.append(epoch_loss)
     cnn.eval()
@@ -132,7 +148,10 @@ def train_models(cnn, linear_layer, xgb_classifier, cnn_epochs, linear_epochs, c
             linear_optimizer.zero_grad()
             linear_output = linear_layer(cnn_out)
             loss = loss_fn(linear_output, labels)
-            running_loss += loss.item()
+            _, preds = torch.max(output, 1)  # Get predicted classes
+            correct += torch.sum(preds == labels.data).item() # Accumulate correct predicitions
+            running_loss += loss.item() * data.size(0)
+            linear_layer.train_accuracy.append(correct / len(train_loader.dataset))
             linear_layer.loss.append(loss.item())
             loss.backward()
             linear_optimizer.step()
@@ -158,7 +177,7 @@ def train_models(cnn, linear_layer, xgb_classifier, cnn_epochs, linear_epochs, c
     return cnn, linear_layer, xgb_classifier
 
 def evaluate_pipeline(cnn, linear_layer, xgb_classifier, loss_fn, user_files=None):
-    if user_files:
+    if user_files is not None:
         # Custom Image List Handling
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -172,27 +191,23 @@ def evaluate_pipeline(cnn, linear_layer, xgb_classifier, loss_fn, user_files=Non
         cnn = cnn.to(device).eval()
         linear_layer = linear_layer.to(device).eval()
 
-        all_linear_outputs = []
-
+        all_linear_outputs = [] # initialize list outside of loop
         with torch.no_grad():
             for data in custom_loader:  # Iterate through custom loader
-                data = data[0].to(device) # Get data and send to the correct device
+                data = data.to(device) # Custom data needs to be sent to device
 
                 cnn_output = cnn(data)
                 linear_output = linear_layer(cnn_output)
-                all_linear_outputs.append(linear_output.cpu().numpy().flatten())
-                
+                all_linear_outputs.append(linear_output.cpu().numpy().flatten())  # No extra dimensions
 
-        # XGBoost Predictions (no labels for custom data, predictions only)
-        xgb_input = [linear_output.cpu().numpy().flatten() for linear_output in all_linear_outputs]
-        xgb_test_data_placeholder = np.zeros((len(xgb_input), 1)) # Placeholder for xgb test data, not used for predicitions.
-        xgb_predictions = xgb_classifier.predict(xgb_test_data_placeholder) #<-- Passing in placeholder instead of xgb_input
+        xgb_input = np.array(all_linear_outputs)  # Make numpy array from list
+        xgb_predictions = xgb_classifier.predict(xgb_input)
 
         eval_dictionary = {
-            "xgb_predictions": xgb_predictions, # Return only predictions
+            "xgb_predictions": xgb_predictions,  # Return only predictions for custom data
         }
 
-        return eval_dictionary # Return predictions for custom images
+        return eval_dictionary
     else: # Test Evaluation
         cnn = cnn.to(device).eval()
         linear_layer = linear_layer.to(device).eval()
@@ -209,10 +224,12 @@ def evaluate_pipeline(cnn, linear_layer, xgb_classifier, loss_fn, user_files=Non
 
                 cnn_output = cnn(data)
                 cnn_loss = loss_fn(cnn_output, labels)
+                cnn.test_loss.append(cnn_loss.item())
                 running_cnn_loss += cnn_loss.item()
 
                 linear_output = linear_layer(cnn_output)
                 linear_loss = loss_fn(linear_output, labels)
+                linear_layer.test_loss.append(linear_loss.item())
                 running_linear_loss += linear_loss.item()
                 
                 all_linear_outputs.append(linear_output.cpu().numpy())
@@ -231,25 +248,33 @@ def evaluate_pipeline(cnn, linear_layer, xgb_classifier, loss_fn, user_files=Non
         class_report = classification_report(test_labels_for_eval, xgb_predictions)
         conf_matrix = confusion_matrix(test_labels_for_eval, xgb_predictions)
 
-        # Plot Losses
-        plt.figure(figsize=(12, 4))
+        # Plotting
+        plt.figure(figsize=(16, 8)) # Increased figure size for better visibility
 
-        plt.subplot(1, 2, 1)
-        plt.plot(cnn.loss, label='CNN Loss')
+        # Training Loss
+        plt.subplot(2, 2, 1)
+        plt.plot(cnn.loss, label='CNN Training Loss')
+        plt.plot(linear_layer.loss, label='Linear Training Loss')
         plt.xlabel('Sample')
         plt.ylabel('Loss')
-        plt.title('CNN Loss per Sample')
+        plt.title('Training Loss')
         plt.legend()
 
-        plt.subplot(1, 2, 2)
-        plt.plot(linear_layer.loss, label='Linear Layer Loss', color='orange')
+        # Training Accuracy
+        plt.subplot(2, 2, 2)
+        plt.plot(cnn.train_accuracy, label='CNN Training Accuracy')
+        plt.plot(linear_layer.train_accuracy, label='Linear Training Accuracy')
         plt.xlabel('Sample')
-        plt.ylabel('Loss')
-        plt.title('Linear Layer Loss per Sample')
+        plt.ylabel('Accuracy')
+        plt.title('Training Accuracy')
         plt.legend()
 
-        plt.tight_layout() # Prevents overlapping plots
-        plt.show()
+        # Test Loss
+        plt.subplot(2, 2, 3)
+        plt.bar(['CNN', 'Linear'], [cnn.test_loss[-1], linear_layer.test_loss[-1]], label='Test Loss', color=['blue', 'orange'])
+        plt.ylabel('Loss')
+        plt.title('Test Loss')
+        plt.legend()
 
         # Plot Confusion Matrix (using seaborn for better visualization)
         plt.figure(figsize=(8, 6))
@@ -271,19 +296,16 @@ def evaluate_pipeline(cnn, linear_layer, xgb_classifier, loss_fn, user_files=Non
     
 def get_imgs(infiles):
     image_list = []
-    if os.path.isfile(infiles):  # Single file
+    if os.path.isfile(infiles):  # Single file - infiles is now a string
         try:
-            image = Image.open(infiles).convert('L')  # Ensure grayscale
-            image = image.resize((28, 28)) # Ensure MNIST size
-            image = transform(image)
-
+            image = Image.open(infiles).convert('L')
+            image = image.resize((28, 28))
+            image = transform(image)  # Apply your transform here
             image_list.append(image)
-
         except Exception as e:
             print(f"Error processing file: {e}")
 
-
-    elif os.path.isdir(infiles):  # Folder
+    elif os.path.isdir(infiles):  # Folder - infiles is now a string
         for filename in os.listdir(infiles):
             if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):  # Check image extensions
                 filepath = os.path.join(infiles, filename)
@@ -343,8 +365,11 @@ def main():
         elif choice == '2':
             try:
                 image_path = input("Enter path to image file: ")
-                image_list = get_imgs([image_path]) # Assuming get_imgs takes a list
-                eval_results = evaluate_pipeline(cnn, linear_layer, xgb_classifier, loss_fn=loss_fn, custom_image_list=image_list)
+                image_list = get_imgs(image_path)
+                transformed_images = [transform(img) for img in image_list] #Transform PIL images to tensors
+                image_tensor = torch.stack(transformed_images)
+                image_tensor = image_tensor.to(device)
+                eval_results = evaluate_pipeline(cnn, linear_layer, xgb_classifier, loss_fn=loss_fn, user_files=image_tensor)
                 print("Predictions for user image:", eval_results["xgb_predictions"])
             except Exception as e: # Catch file errors, etc
                 print(f"Error processing image: {e}")
